@@ -5,12 +5,10 @@
 Файлы без даты в названии, где внутри листа найдено несколько дней недели
 (ПОНЕДЕЛЬНИК/ВТОРНИК/...), показываются отдельной кнопкой «Общее расписание»
 и ведут в выбор дня недели, а дальше — как обычно, класс -> буква.
-Кароче сами разберетесь с кодом если кому нужен ваще мой проэкт по факту там поменять только ссылку на ваш публичный мейл типо
- "https://cloud.mail.ru/public/"ключ ващего публичного облока"
 
 ВНИМАНИЕ: этот файл сам по себе НЕ умеет ходить в Telegram через MTProto-
-прокси. Если Telegram у вас доступен только через локальный MTProxy —
-запускате schedule_bot_mtproto.py, а не этот файл напрямую (этот файл тогда
+прокси. Если Telegram у тебя доступен только через локальный MTProxy —
+запускай schedule_bot_mtproto.py, а не этот файл напрямую (этот файл тогда
 годится только для проверки парсера через --debug).
 
 Установка:   pip install requests openpyxl
@@ -130,6 +128,92 @@ log = logging.getLogger("schedule")
 
 SESSION = requests.Session()
 SESSION.trust_env = False   # не использовать системный прокси/VPN для Mail.ru
+
+
+# ───────────────────────── Погода (Курган) ─────────────────────────
+# Источник — wttr.in (JSON-режим format=j1,lang=ru). Open-Meteo пробовали
+# раньше — у многих провайдеров РФ к нему просто не достучаться (таймауты/
+# обрыв TLS), а wttr.in в такой же ситуации отвечает нормально.
+
+KURGAN_LAT, KURGAN_LON = 55.4410, 65.3411
+WEATHER_TTL = 900  # 15 минут — не дёргать wttr.in на каждый /start
+_weather_cache = {"ts": 0.0, "text": None}
+
+
+def _condition_icon(text):
+    """Смайл по ключевым словам в русском описании погоды от wttr.in."""
+    t = (text or "").lower()
+    if "гроза" in t:
+        return "⛈"
+    if "метел" in t or "снег" in t:
+        return "🌨"
+    if "ливень" in t or "дожд" in t:
+        return "🌧"
+    if "морось" in t:
+        return "🌦"
+    if "туман" in t or "дымк" in t:
+        return "🌫"
+    if "пасмур" in t:
+        return "☁️"
+    if "облач" in t:
+        return "⛅"
+    if "ясно" in t or "солнечно" in t:
+        return "☀️"
+    return "🌡"
+
+
+def weather_line():
+    """Строка погоды для Кургана, с кэшем на WEATHER_TTL секунд.
+    Никогда не бросает исключение наружу — при любой ошибке сети просто
+    вернёт старое значение из кэша (или None, если ещё ни разу не получилось)."""
+    try:
+        now_ts = time.time()
+        if _weather_cache["text"] is not None and now_ts - _weather_cache["ts"] < WEATHER_TTL:
+            return _weather_cache["text"]
+    except Exception:
+        now_ts = time.time()
+    try:
+        # компактный текстовый формат вместо тяжёлого j1 (несколько КБ JSON с
+        # прогнозом на 3 дня и астрономией) — на канале, где большие ответы
+        # обрываются на полпути, короткая строка долетает надёжнее
+        fmt = quote("%t|%h|%w|%C", safe="")
+        url = f"https://wttr.in/~{KURGAN_LAT},{KURGAN_LON}?format={fmt}&m&lang=ru"
+        r = SESSION.get(url, timeout=6)
+        r.raise_for_status()
+        raw_t, raw_h, raw_w, raw_c = (r.text.strip().split("|") + ["", "", "", ""])[:4]
+
+        def first_int(s):
+            mm = re.search(r"[+-]?\d+", s)
+            return int(mm.group()) if mm else None
+
+        temp = first_int(raw_t)
+        if temp is None:
+            raise ValueError(f"не распознал температуру в ответе: {r.text!r}")
+        humidity = first_int(raw_h) or 0
+        wind = (first_int(raw_w) or 0) / 3.6   # км/ч -> м/с
+        cond = raw_c.strip() or "—"
+
+        if temp < -15:
+            temp_icon = "❄️"
+        elif temp < 15:
+            temp_icon = "🥶"
+        elif temp < 24:
+            temp_icon = "🌡️"
+        else:
+            temp_icon = "🥵"
+
+        text = (
+            f"{temp_icon} {temp:+.0f}°C, {_condition_icon(cond)} {cond.lower()}, "
+            f"💨 ветер {wind:.0f} м/с, 💦 влажность {humidity:.0f}%"
+        )
+        _weather_cache.update(ts=now_ts, text=text)
+        return text
+    except Exception:
+        log.exception("Не удалось получить погоду")
+        try:
+            return _weather_cache["text"]   # старое значение, если было, иначе None
+        except Exception:
+            return None
 
 
 # ───────────────────────── 1. Облако Mail.ru ─────────────────────────
@@ -380,30 +464,56 @@ SCHEDULES: dict = {}
 WEEK_FILES: dict = {}
 
 
+def _store_file(name, content, digest):
+    """Разбирает файл и кладёт его в SCHEDULES или WEEK_FILES (заменяя старую запись)."""
+    days = parse_days(content)
+    d = date_from_name(name)
+    SCHEDULES.pop(name, None)
+    WEEK_FILES.pop(name, None)
+    if d is None and len(days) > 1:
+        # файл-мастер сразу на несколько дней недели («ПРОЕКТ» и т.п.)
+        WEEK_FILES[name] = {
+            "key": hashlib.md5(name.encode()).hexdigest()[:8],
+            "title": name.rsplit(".", 1)[0],
+            "days": days,
+            "digest": digest,
+        }
+    else:
+        data = next(iter(days.values()), {})
+        SCHEDULES[name] = {
+            "sid": d.isoformat() if d else "f" + hashlib.md5(name.encode()).hexdigest()[:8],
+            "title": f"{d.day} {MONTHS_REV[d.month]} {d.year}" if d else name.rsplit(".", 1)[0],
+            "sort": d.isoformat() if d else name,
+            "data": data,
+            "digest": digest,
+        }
+
+
 def sync_refresh():
+    """Синхронизирует кэш с папкой.
+
+    Раньше файл, имя которого уже было в кэше, пропускался навсегда — поэтому
+    если в облаке заменяли файл с тем же именем (правка расписания на день),
+    бот этого не замечал. Теперь каждый файл скачивается целиком, считается
+    SHA-256 от ВСЕГО содержимого, и если хэш изменился — файл разбирается заново.
+    Если новая версия не скачалась или не разобралась — остаётся старая.
+    Возвращает список имён файлов, которые добавились или изменились.
+    """
     files = list_folder()
     names_now = {n for n, _ in files}
+    changed = []
     for name, links in files:
-        if name in SCHEDULES or name in WEEK_FILES:
-            continue
-        log.info("Новый файл: %s", name)
-        days = parse_days(download(links))
-        d = date_from_name(name)
-        if d is None and len(days) > 1:
-            # файл-мастер сразу на несколько дней недели («ПРОЕКТ» и т.п.)
-            WEEK_FILES[name] = {
-                "key": hashlib.md5(name.encode()).hexdigest()[:8],
-                "title": name.rsplit(".", 1)[0],
-                "days": days,
-            }
-        else:
-            data = next(iter(days.values()), {})
-            SCHEDULES[name] = {
-                "sid": d.isoformat() if d else "f" + hashlib.md5(name.encode()).hexdigest()[:8],
-                "title": f"{d.day} {MONTHS_REV[d.month]} {d.year}" if d else name.rsplit(".", 1)[0],
-                "sort": d.isoformat() if d else name,
-                "data": data,
-            }
+        known = SCHEDULES.get(name) or WEEK_FILES.get(name)
+        try:
+            content = download(links)
+            digest = hashlib.sha256(content).hexdigest()
+            if known and known.get("digest") == digest:
+                continue                      # содержимое то же самое
+            log.info("%s: %s", "Файл изменился" if known else "Новый файл", name)
+            _store_file(name, content, digest)
+            changed.append(name)
+        except Exception:
+            log.exception("Не удалось обработать файл %s (оставляю прежнюю версию)", name)
     for name in list(SCHEDULES):        # удалённые из папки — убираем и у себя
         if name not in names_now:
             log.info("Файл удалён из папки: %s", name)
@@ -412,6 +522,7 @@ def sync_refresh():
         if name not in names_now:
             log.info("Файл удалён из папки: %s", name)
             del WEEK_FILES[name]
+    return changed
 
 
 def week_file_by_key(key):
@@ -781,10 +892,16 @@ def screen_dates():
     if not buttons and len(extra) == 1:
         return "Пока расписаний в папке нет — попробуй чуть позже.", None
     markup = kb(buttons, per_row=2, extra_rows=extra)
+    top_lines = []
     status = holiday_status()
-    head = "За какое число нужно расписание?"
     if status:
-        head = f"{status}\n\n{head}"
+        top_lines.append(status)
+    weather = weather_line()
+    if weather:
+        top_lines.append(weather)
+    head = "За какое число нужно расписание?"
+    if top_lines:
+        head = "\n".join(top_lines) + "\n\n" + head
     return head, markup
 
 
@@ -822,6 +939,44 @@ def screen_letters(sid, grade):
     return f"📅 {htmllib.escape(s['title'])}\nКласс {grade}. Выбери букву:", markup
 
 
+# ───────────────────────── Понедельник и пропуски ─────────────────────────
+
+TALKS_TITLE = "Разговоры о важном"
+TALKS_TIME = "8:00 - 8:30"
+
+
+def sid_weekday(sid):
+    """Номер дня недели (0 = понедельник) для расписания; None, если неизвестен."""
+    if sid.startswith("w~"):
+        return WEEKDAY_ORDER.get(sid.split("~", 2)[2])
+    try:
+        return date.fromisoformat(sid).weekday()
+    except ValueError:
+        return None
+
+
+def build_lesson_lines(lessons, monday):
+    """Строки уроков: по порядку номеров, пропуски — «N. -», а в понедельник
+    первой строкой всегда «Разговоры о важном» 8:00-8:30."""
+    items = sorted(lessons, key=lambda x: x[0])
+    if monday:
+        # если «Разговоры о важном» уже есть в таблице отдельным уроком — не дублируем
+        items = [it for it in items if TALKS_TITLE.casefold() not in str(it[2]).casefold()]
+    lines = []
+    if monday:
+        lines.append(f"0. {TALKS_TIME} {TALKS_TITLE}")
+    prev = None
+    for num, t, subj in items:
+        if prev is not None and 1 < num - prev <= 8:
+            for gap in range(prev + 1, num):
+                lines.append(f"{gap}. -")
+        lines.append(
+            f"{num}. {htmllib.escape(fmt_time(t))} {htmllib.escape(fmt_subject(subj))}"
+        )
+        prev = num if prev is None else max(prev, num)
+    return lines
+
+
 def screen_schedule(sid, grade, letter):
     s = by_sid(sid)
     if not s:
@@ -832,10 +987,7 @@ def screen_schedule(sid, grade, letter):
         for note in info.get("notices", []):
             lines.append(f"📌 {htmllib.escape(note)}")
         if info["lessons"]:
-            for num, t, subj in info["lessons"]:
-                lines.append(
-                    f"{num}. {htmllib.escape(fmt_time(t))} {htmllib.escape(fmt_subject(subj))}"
-                )
+            lines.extend(build_lesson_lines(info["lessons"], sid_weekday(sid) == 0))
         elif not info.get("notices"):
             lines.append("Уроков в этот день нет 🎉")
     else:
