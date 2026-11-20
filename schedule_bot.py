@@ -291,10 +291,16 @@ def build_merge_map(ws):
                 m[(r, c)] = top
     return m
 
-
 # строки-баннеры без номера урока, которые не показываем как «событие»
 # (обычные ежедневные надписи, неинтересные сами по себе)
-IGNORE_BANNERS = {"разговоры о важном"}
+def is_daily_banner(text) -> bool:
+    """«Разговоры о важном» / «Россия — мои горизонты» в любом написании
+    (дефис, тире, регистр, лишние пробелы, ё/е). Эти строки бот добавляет сам
+    нулевым уроком, поэтому как отдельное событие 📌 их не показываем."""
+    t = re.sub(r"[\s\-–—−]+", "", str(text or "").casefold().replace("ё", "е"))
+    return "разговор" in t and "важн" in t or "горизонт" in t
+
+
 
 
 def find_weekday(text: str):
@@ -386,7 +392,7 @@ def parse_days(content: bytes):
                         and rng.max_row <= r_end
                     ):
                         text = str(ws.cell(rng.min_row, rng.min_col).value or "").strip()
-                        if text:
+                        if text and not is_daily_banner(text):
                             notices.append(text)
                         skip_rows.update(range(rng.min_row, rng.max_row + 1))
 
@@ -403,7 +409,7 @@ def parse_days(content: bytes):
                         # строка без номера урока: обычную «Разговоры о важном»
                         # молчим, а прочие подписи (Медосмотр, «Россия — мои
                         # горизонты» и т.п.) показываем отдельным событием
-                        if t and subj.lower() not in IGNORE_BANNERS:
+                        if t and not is_daily_banner(subj):
                             notices.append(subj)
                         continue
                     lessons.append((num, t, subj))
@@ -479,8 +485,12 @@ def _store_file(name, content, digest):
             "digest": digest,
         }
     else:
+        # день недели берём из даты в имени, а если её нет — из подписи
+        # («ЧЕТВЕРГ») внутри самого файла, чтобы «нулевые» уроки работали и там
+        wd_name = next((k for k in days if k), None)
         data = next(iter(days.values()), {})
         SCHEDULES[name] = {
+            "weekday": WEEKDAY_ORDER.get(wd_name) if d is None else d.weekday(),
             "sid": d.isoformat() if d else "f" + hashlib.md5(name.encode()).hexdigest()[:8],
             "title": f"{d.day} {MONTHS_REV[d.month]} {d.year}" if d else name.rsplit(".", 1)[0],
             "sort": d.isoformat() if d else name,
@@ -944,27 +954,29 @@ def screen_letters(sid, grade):
 TALKS_TITLE = "Разговоры о важном"
 TALKS_TIME = "8:00 - 8:30"
 
+HORIZONS_TITLE = "Россия — мои горизонты"
+HORIZONS_TIME = "8:00 - 8:30"
 
-def sid_weekday(sid):
-    """Номер дня недели (0 = понедельник) для расписания; None, если неизвестен."""
-    if sid.startswith("w~"):
-        return WEEKDAY_ORDER.get(sid.split("~", 2)[2])
-    try:
-        return date.fromisoformat(sid).weekday()
-    except ValueError:
-        return None
-
-
-def build_lesson_lines(lessons, monday):
-    """Строки уроков: по порядку номеров, пропуски — «N. -», а в понедельник
-    первой строкой всегда «Разговоры о важном» 8:00-8:30."""
+def build_lesson_lines(lessons, weekday_idx):
+    """Строки уроков: по порядку номеров, пропуски — «N. -».
+    В понедельник (weekday_idx == 0) первой строкой идёт «Разговоры о важном».
+    В четверг (weekday_idx == 3) первой строкой идёт «Россия — мои горизонты» нулевым уроком."""
     items = sorted(lessons, key=lambda x: x[0])
-    if monday:
-        # если «Разговоры о важном» уже есть в таблице отдельным уроком — не дублируем
+    
+    # Очищаем дубликаты из таблицы, чтобы не было накладок в ОЗУ
+    if weekday_idx == 0:
         items = [it for it in items if TALKS_TITLE.casefold() not in str(it[2]).casefold()]
+    elif weekday_idx == 3:
+        items = [it for it in items if "горизонт" not in str(it[2]).casefold()]
+        
     lines = []
-    if monday:
+    
+    # Инжект нулевых уроков в прод расписания
+    if weekday_idx == 0:
         lines.append(f"0. {TALKS_TIME} {TALKS_TITLE}")
+    elif weekday_idx == 3:
+        lines.append(f"0. {HORIZONS_TIME} {HORIZONS_TITLE}")
+        
     prev = None
     for num, t, subj in items:
         if prev is not None and 1 < num - prev <= 8:
@@ -975,6 +987,24 @@ def build_lesson_lines(lessons, monday):
         )
         prev = num if prev is None else max(prev, num)
     return lines
+
+def sid_weekday(sid):
+    """Возвращает индекс дня недели (понедельник=0) по идентификатору расписания.
+
+    Для обычного расписания sid — дата в формате YYYY-MM-DD.
+    Для недельного файла sid имеет вид w~ключ~название_дня.
+    """
+    if isinstance(sid, str) and sid.startswith("w~"):
+        parts = sid.split("~", 2)
+        if len(parts) == 3:
+            weekday = find_weekday(parts[2])
+            return WEEKDAY_ORDER.get(weekday)
+        return None
+
+    try:
+        return date.fromisoformat(str(sid)).weekday()
+    except (TypeError, ValueError):
+        return None
 
 
 def screen_schedule(sid, grade, letter):
@@ -987,7 +1017,10 @@ def screen_schedule(sid, grade, letter):
         for note in info.get("notices", []):
             lines.append(f"📌 {htmllib.escape(note)}")
         if info["lessons"]:
-            lines.extend(build_lesson_lines(info["lessons"], sid_weekday(sid) == 0))
+            wd_idx = sid_weekday(sid)
+            if wd_idx is None:
+                wd_idx = s.get("weekday")
+            lines.extend(build_lesson_lines(info["lessons"], wd_idx))
         elif not info.get("notices"):
             lines.append("Уроков в этот день нет 🎉")
     else:
